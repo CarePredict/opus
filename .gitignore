@@ -21,6 +21,7 @@ install-sh
 .libs
 .dirstamp
 *.a
+!libopus.a
 *.exe
 *.la
 *-gnu.S
