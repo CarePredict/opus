@@ -73,6 +73,7 @@ struct OpusCustomDecoder {
    int downsample;
    int start, end;
    int signalling;
+   int disable_inv;
    int arch;
 
    /* Everything beyond this point gets cleared on a reset */
@@ -163,6 +164,11 @@ OPUS_CUSTOM_NOSTATIC int opus_custom_decoder_init(CELTDecoder *st, const CELTMod
    st->start = 0;
    st->end = st->mode->effEBands;
    st->signalling = 1;
+#ifdef ENABLE_UPDATE_DRAFT
+   st->disable_inv = channels == 1;
+#else
+   st->disable_inv = 0;
+#endif
    st->arch = opus_select_arch();
 
    opus_custom_decoder_ctl(st, OPUS_RESET_STATE);
@@ -177,6 +183,36 @@ void opus_custom_decoder_destroy(CELTDecoder *st)
 }
 #endif /* CUSTOM_MODES */
 
+#ifndef CUSTOM_MODES
+/* Special case for stereo with no downsampling and no accumulation. This is
+   quite common and we can make it faster by processing both channels in the
+   same loop, reducing overhead due to the dependency loop in the IIR filter. */
+static void deemphasis_stereo_simple(celt_sig *in[], opus_val16 *pcm, int N, const opus_val16 coef0,
+      celt_sig *mem)
+{
+   celt_sig * OPUS_RESTRICT x0;
+   celt_sig * OPUS_RESTRICT x1;
+   celt_sig m0, m1;
+   int j;
+   x0=in[0];
+   x1=in[1];
+   m0 = mem[0];
+   m1 = mem[1];
+   for (j=0;j<N;j++)
+   {
+      celt_sig tmp0, tmp1;
+      /* Add VERY_SMALL to x[] first to reduce dependency chain. */
+      tmp0 = x0[j] + VERY_SMALL + m0;
+      tmp1 = x1[j] + VERY_SMALL + m1;
+      m0 = MULT16_32_Q15(coef0, tmp0);
+      m1 = MULT16_32_Q15(coef0, tmp1);
+      pcm[2*j  ] = SCALEOUT(SIG2WORD16(tmp0));
+      pcm[2*j+1] = SCALEOUT(SIG2WORD16(tmp1));
+   }
+   mem[0] = m0;
+   mem[1] = m1;
+}
+#endif
 
 #ifndef RESYNTH
 static
@@ -190,6 +226,14 @@ void deemphasis(celt_sig *in[], opus_val16 *pcm, int N, int C, int downsample, c
    opus_val16 coef0;
    VARDECL(celt_sig, scratch);
    SAVE_STACK;
+#ifndef CUSTOM_MODES
+   /* Short version for common case. */
+   if (downsample == 1 && C == 2 && !accum)
+   {
+      deemphasis_stereo_simple(in, pcm, N, coef[0], mem);
+      return;
+   }
+#endif
 #ifndef FIXED_POINT
    (void)accum;
    celt_assert(accum==0);
@@ -225,7 +269,7 @@ void deemphasis(celt_sig *in[], opus_val16 *pcm, int N, int C, int downsample, c
          /* Shortcut for the standard (non-custom modes) case */
          for (j=0;j<N;j++)
          {
-            celt_sig tmp = x[j] + m + VERY_SMALL;
+            celt_sig tmp = x[j] + VERY_SMALL + m;
             m = MULT16_32_Q15(coef0, tmp);
             scratch[j] = tmp;
          }
@@ -246,7 +290,7 @@ void deemphasis(celt_sig *in[], opus_val16 *pcm, int N, int C, int downsample, c
          {
             for (j=0;j<N;j++)
             {
-               celt_sig tmp = x[j] + m + VERY_SMALL;
+               celt_sig tmp = x[j] + VERY_SMALL + m;
                m = MULT16_32_Q15(coef0, tmp);
                y[j*C] = SCALEOUT(SIG2WORD16(tmp));
             }
@@ -1005,7 +1049,8 @@ int celt_decode_with_ec(CELTDecoder * OPUS_RESTRICT st, const unsigned char *dat
 
    quant_all_bands(0, mode, start, end, X, C==2 ? X+N : NULL, collapse_masks,
          NULL, pulses, shortBlocks, spread_decision, dual_stereo, intensity, tf_res,
-         len*(8<<BITRES)-anti_collapse_rsv, balance, dec, LM, codedBands, &st->rng, 0, st->arch);
+         len*(8<<BITRES)-anti_collapse_rsv, balance, dec, LM, codedBands, &st->rng, 0,
+         st->arch, st->disable_inv);
 
    if (anti_collapse_rsv > 0)
    {
@@ -1258,6 +1303,26 @@ int opus_custom_decoder_ctl(CELTDecoder * OPUS_RESTRICT st, int request, ...)
          if (value==0)
             goto bad_arg;
          *value=st->rng;
+      }
+      break;
+      case OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST:
+      {
+          opus_int32 value = va_arg(ap, opus_int32);
+          if(value<0 || value>1)
+          {
+             goto bad_arg;
+          }
+          st->disable_inv = value;
+      }
+      break;
+      case OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST:
+      {
+          opus_int32 *value = va_arg(ap, opus_int32*);
+          if (!value)
+          {
+             goto bad_arg;
+          }
+          *value = st->disable_inv;
       }
       break;
       default:

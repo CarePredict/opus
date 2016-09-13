@@ -705,7 +705,7 @@ static void surround_rate_allocation(
       total = (nb_uncoupled<<8)         /* mono */
             + coupled_ratio*nb_coupled /* stereo */
             + nb_lfe*lfe_ratio;
-      channel_rate = 256*(st->bitrate_bps-lfe_offset*nb_lfe-stream_offset*(nb_coupled+nb_uncoupled))/total;
+      channel_rate = 256*(opus_int64)(st->bitrate_bps-lfe_offset*nb_lfe-stream_offset*(nb_coupled+nb_uncoupled))/total;
    }
 #ifndef FIXED_POINT
    if (st->variable_duration==OPUS_FRAMESIZE_VARIABLE && frame_size != Fs/50)
@@ -747,7 +747,8 @@ static void ambisonics_rate_allocation(
 
    if (st->bitrate_bps==OPUS_AUTO)
    {
-      total_rate = num_channels * (20000 + st->layout.nb_streams*(Fs+60*Fs/frame_size));
+      total_rate = (st->layout.nb_coupled_streams + st->layout.nb_streams) *
+         (Fs+60*Fs/frame_size) + st->layout.nb_streams * 15000;
    } else if (st->bitrate_bps==OPUS_BITRATE_MAX)
    {
       total_rate = num_channels * 320000;
@@ -861,13 +862,11 @@ static int opus_multistream_encode_native
 
    {
       opus_int32 delay_compensation;
-      int channels;
 
-      channels = st->layout.nb_streams + st->layout.nb_coupled_streams;
       opus_encoder_ctl((OpusEncoder*)ptr, OPUS_GET_LOOKAHEAD(&delay_compensation));
       delay_compensation -= Fs/400;
       frame_size = compute_frame_size(pcm, analysis_frame_size,
-            st->variable_duration, channels, Fs, st->bitrate_bps,
+            st->variable_duration, st->layout.nb_channels, Fs, st->bitrate_bps,
             delay_compensation, downmix
 #ifndef DISABLE_FLOAT_API
             , st->subframe_mem
@@ -1161,9 +1160,11 @@ int opus_multistream_encoder_ctl(OpusMSEncoder *st, int request, ...)
    case OPUS_SET_BITRATE_REQUEST:
    {
       opus_int32 value = va_arg(ap, opus_int32);
-      if (value<0 && value!=OPUS_AUTO && value!=OPUS_BITRATE_MAX)
+      if (value != OPUS_AUTO && value != OPUS_BITRATE_MAX)
       {
-         goto bad_arg;
+         if (value <= 0)
+            goto bad_arg;
+         value = IMIN(300000*st->layout.nb_channels, IMAX(500*st->layout.nb_channels, value));
       }
       st->bitrate_bps = value;
    }
@@ -1206,6 +1207,7 @@ int opus_multistream_encoder_ctl(OpusMSEncoder *st, int request, ...)
    case OPUS_GET_INBAND_FEC_REQUEST:
    case OPUS_GET_FORCE_CHANNELS_REQUEST:
    case OPUS_GET_PREDICTION_DISABLED_REQUEST:
+   case OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST:
    {
       OpusEncoder *enc;
       /* For int32* GET params, just query the first stream */
@@ -1252,6 +1254,7 @@ int opus_multistream_encoder_ctl(OpusMSEncoder *st, int request, ...)
    case OPUS_SET_FORCE_MODE_REQUEST:
    case OPUS_SET_FORCE_CHANNELS_REQUEST:
    case OPUS_SET_PREDICTION_DISABLED_REQUEST:
+   case OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST:
    {
       int s;
       /* This works for int32 params */
