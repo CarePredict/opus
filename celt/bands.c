@@ -226,7 +226,7 @@ void denormalise_bands(const CELTMode *m, const celt_norm * OPUS_RESTRICT X,
       band_end = M*eBands[i+1];
       lg = SATURATE16(ADD32(bandLogE[i], SHL32((opus_val32)eMeans[i],6)));
 #ifndef FIXED_POINT
-      g = celt_exp2(lg);
+      g = celt_exp2(MIN32(32.f, lg));
 #else
       /* Handle the integer part of the log energy */
       shift = 16-(lg>>DB_SHIFT);
@@ -683,6 +683,7 @@ struct band_ctx {
    opus_uint32 seed;
    int arch;
    int theta_round;
+   int disable_inv;
 };
 
 struct split_ctx {
@@ -832,7 +833,7 @@ static void compute_theta(struct band_ctx *ctx, struct split_ctx *sctx,
    } else if (stereo) {
       if (encode)
       {
-         inv = itheta > 8192;
+         inv = itheta > 8192 && !ctx->disable_inv;
          if (inv)
          {
             int j;
@@ -848,6 +849,9 @@ static void compute_theta(struct band_ctx *ctx, struct split_ctx *sctx,
          else
             inv = ec_dec_bit_logp(ec, 2);
       } else
+         inv = 0;
+      /* inv flag override to avoid problems with downmixing. */
+      if (ctx->disable_inv)
          inv = 0;
       itheta = 0;
    }
@@ -1036,7 +1040,7 @@ static unsigned quant_partition(struct band_ctx *ctx, celt_norm *X,
          /* Finally do the actual quantization */
          if (encode)
          {
-            cm = alg_quant(X, N, K, spread, B, ec, gain, ctx->resynth);
+            cm = alg_quant(X, N, K, spread, B, ec, gain, ctx->resynth, ctx->arch);
          } else {
             cm = alg_unquant(X, N, K, spread, B, ec, gain);
          }
@@ -1361,13 +1365,25 @@ static unsigned quant_band_stereo(struct band_ctx *ctx, celt_norm *X, celt_norm 
    return cm;
 }
 
+static void special_hybrid_folding(const CELTMode *m, celt_norm *norm, celt_norm *norm2, int start, int M, int dual_stereo)
+{
+   int n1, n2;
+   const opus_int16 * OPUS_RESTRICT eBands = m->eBands;
+   n1 = M*(eBands[start+1]-eBands[start]);
+   n2 = M*(eBands[start+2]-eBands[start+1]);
+   /* Duplicate enough of the first band folding data to be able to fold the second band.
+      Copies no data for CELT-only mode. */
+   OPUS_COPY(&norm[n1], &norm[2*n1 - n2], n2-n1);
+   if (dual_stereo)
+      OPUS_COPY(&norm2[n1], &norm2[2*n1 - n2], n2-n1);
+}
 
 void quant_all_bands(int encode, const CELTMode *m, int start, int end,
       celt_norm *X_, celt_norm *Y_, unsigned char *collapse_masks,
       const celt_ener *bandE, int *pulses, int shortBlocks, int spread,
       int dual_stereo, int intensity, int *tf_res, opus_int32 total_bits,
       opus_int32 balance, ec_ctx *ec, int LM, int codedBands,
-      opus_uint32 *seed, int complexity, int arch)
+      opus_uint32 *seed, int complexity, int arch, int disable_inv)
 {
    int i;
    opus_int32 remaining_bits;
@@ -1433,6 +1449,7 @@ void quant_all_bands(int encode, const CELTMode *m, int start, int end,
    ctx.seed = *seed;
    ctx.spread = spread;
    ctx.arch = arch;
+   ctx.disable_inv = disable_inv;
    ctx.resynth = resynth;
    ctx.theta_round = 0;
    for (i=start;i<end;i++)
@@ -1472,8 +1489,15 @@ void quant_all_bands(int encode, const CELTMode *m, int start, int end,
          b = 0;
       }
 
+#ifdef ENABLE_UPDATE_DRAFT
+      if (resynth && (M*eBands[i]-N >= M*eBands[start] || i==start+1) && (update_lowband || lowband_offset==0))
+            lowband_offset = i;
+      if (i == start+1)
+         special_hybrid_folding(m, norm, norm2, start, M, dual_stereo);
+#else
       if (resynth && M*eBands[i]-N >= M*eBands[start] && (update_lowband || lowband_offset==0))
             lowband_offset = i;
+#endif
 
       tf_change = tf_res[i];
       ctx.tf_change = tf_change;
@@ -1499,7 +1523,11 @@ void quant_all_bands(int encode, const CELTMode *m, int start, int end,
          fold_start = lowband_offset;
          while(M*eBands[--fold_start] > effective_lowband+norm_offset);
          fold_end = lowband_offset-1;
+#ifdef ENABLE_UPDATE_DRAFT
+         while(++fold_end < i && M*eBands[fold_end] < effective_lowband+norm_offset+N);
+#else
          while(M*eBands[++fold_end] < effective_lowband+norm_offset+N);
+#endif
          x_cm = y_cm = 0;
          fold_i = fold_start; do {
            x_cm |= collapse_masks[fold_i*C+0];
@@ -1575,6 +1603,8 @@ void quant_all_bands(int encode, const CELTMode *m, int start, int end,
                ctx = ctx_save;
                OPUS_COPY(X, X_save, N);
                OPUS_COPY(Y, Y_save, N);
+               if (i == start+1)
+                  special_hybrid_folding(m, norm, norm2, start, M, dual_stereo);
                /* Encode and round up. */
                ctx.theta_round = 1;
                x_cm = quant_band_stereo(&ctx, X, Y, N, b, B,

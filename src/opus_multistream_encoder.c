@@ -240,6 +240,7 @@ void surround_analysis(const CELTMode *celt_mode, const void *pcm, opus_val16 *b
    int pos[8] = {0};
    int upsample;
    int frame_size;
+   int freq_size;
    opus_val16 channel_offset;
    opus_val32 bandE[21];
    opus_val16 maskLogE[3][21];
@@ -250,6 +251,7 @@ void surround_analysis(const CELTMode *celt_mode, const void *pcm, opus_val16 *b
 
    upsample = resampling_factor(rate);
    frame_size = len*upsample;
+   freq_size = IMIN(960, frame_size);
 
    /* LM = log2(frame_size / 120) */
    for (LM=0;LM<celt_mode->maxLM;LM++)
@@ -258,7 +260,7 @@ void surround_analysis(const CELTMode *celt_mode, const void *pcm, opus_val16 *b
 
    ALLOC(in, frame_size+overlap, opus_val32);
    ALLOC(x, len, opus_val16);
-   ALLOC(freq, frame_size, opus_val32);
+   ALLOC(freq, freq_size, opus_val32);
 
    channel_pos(channels, pos);
 
@@ -268,6 +270,9 @@ void surround_analysis(const CELTMode *celt_mode, const void *pcm, opus_val16 *b
 
    for (c=0;c<channels;c++)
    {
+      int frame;
+      int nb_frames = frame_size/freq_size;
+      celt_assert(nb_frames*freq_size == frame_size);
       OPUS_COPY(in, mem+c*overlap, overlap);
       (*copy_channel_in)(x, 1, pcm, channels, c, len);
       celt_preemphasis(x, in+overlap, frame_size, 1, upsample, celt_mode->preemph, preemph_mem+c, 0);
@@ -284,18 +289,26 @@ void surround_analysis(const CELTMode *celt_mode, const void *pcm, opus_val16 *b
          }
       }
 #endif
-      clt_mdct_forward(&celt_mode->mdct, in, freq, celt_mode->window,
-            overlap, celt_mode->maxLM-LM, 1, arch);
-      if (upsample != 1)
+      OPUS_CLEAR(bandE, 21);
+      for (frame=0;frame<nb_frames;frame++)
       {
-         int bound = len;
-         for (i=0;i<bound;i++)
-            freq[i] *= upsample;
-         for (;i<frame_size;i++)
-            freq[i] = 0;
-      }
+         opus_val32 tmpE[21];
+         clt_mdct_forward(&celt_mode->mdct, in+960*frame, freq, celt_mode->window,
+               overlap, celt_mode->maxLM-LM, 1, arch);
+         if (upsample != 1)
+         {
+            int bound = freq_size/upsample;
+            for (i=0;i<bound;i++)
+               freq[i] *= upsample;
+            for (;i<freq_size;i++)
+               freq[i] = 0;
+         }
 
-      compute_band_energies(celt_mode, freq, bandE, 21, 1, LM);
+         compute_band_energies(celt_mode, freq, tmpE, 21, 1, LM);
+         /* If we have multiple frames, take the max energy. */
+         for (i=0;i<21;i++)
+            bandE[i] = MAX32(bandE[i], tmpE[i]);
+      }
       amp2Log2(celt_mode, 21, 21, bandE, bandLogE+21*c, 1);
       /* Apply spreading function with -6 dB/band going up and -12 dB/band going down. */
       for (i=1;i<21;i++)
@@ -672,41 +685,50 @@ static void surround_rate_allocation(
    int lfe_offset;
    int coupled_ratio; /* Q8 */
    int lfe_ratio;     /* Q8 */
+   int nb_lfe;
+   int nb_uncoupled;
+   int nb_coupled;
+   int nb_normal;
+   opus_int32 channel_offset;
+   opus_int32 bitrate;
+   int total;
 
-   if (st->bitrate_bps > st->layout.nb_channels*40000)
-      stream_offset = 20000;
-   else
-      stream_offset = st->bitrate_bps/st->layout.nb_channels/2;
-   stream_offset += 60*(Fs/frame_size-50);
-   /* We start by giving each stream (coupled or uncoupled) the same bitrate.
+   nb_lfe = (st->lfe_stream!=-1);
+   nb_coupled = st->layout.nb_coupled_streams;
+   nb_uncoupled = st->layout.nb_streams-nb_coupled-nb_lfe;
+   nb_normal = 2*nb_coupled + nb_uncoupled;
+
+   /* Give each non-LFE channel enough bits per channel for coding band energy. */
+   channel_offset = 40*IMAX(50, Fs/frame_size);
+
+   if (st->bitrate_bps==OPUS_AUTO)
+   {
+      bitrate = nb_normal*(channel_offset + Fs + 10000) + 8000*nb_lfe;
+   } else if (st->bitrate_bps==OPUS_BITRATE_MAX)
+   {
+      bitrate = nb_normal*300000 + nb_lfe*128000;
+   } else {
+      bitrate = st->bitrate_bps;
+   }
+
+   /* Give LFE some basic stream_channel allocation but never exceed 1/20 of the
+      total rate for the non-energy part to avoid problems at really low rate. */
+   lfe_offset = IMIN(bitrate/20, 3000) + 15*IMAX(50, Fs/frame_size);
+
+   /* We give each stream (coupled or uncoupled) a starting bitrate.
       This models the main saving of coupled channels over uncoupled. */
-   /* The LFE stream is an exception to the above and gets fewer bits. */
-   lfe_offset = 3500 + 60*(Fs/frame_size-50);
-   /* Coupled streams get twice the mono rate after the first 20 kb/s. */
+   stream_offset = (bitrate - channel_offset*nb_normal - lfe_offset*nb_lfe)/nb_normal/2;
+   stream_offset = IMAX(0, IMIN(20000, stream_offset));
+
+   /* Coupled streams get twice the mono rate after the offset is allocated. */
    coupled_ratio = 512;
    /* Should depend on the bitrate, for now we assume LFE gets 1/8 the bits of mono */
    lfe_ratio = 32;
 
-   /* Compute bitrate allocation between streams */
-   if (st->bitrate_bps==OPUS_AUTO)
-   {
-      channel_rate = Fs+60*Fs/frame_size;
-   } else if (st->bitrate_bps==OPUS_BITRATE_MAX)
-   {
-      channel_rate = 300000;
-   } else {
-      int nb_lfe;
-      int nb_uncoupled;
-      int nb_coupled;
-      int total;
-      nb_lfe = (st->lfe_stream!=-1);
-      nb_coupled = st->layout.nb_coupled_streams;
-      nb_uncoupled = st->layout.nb_streams-nb_coupled-nb_lfe;
-      total = (nb_uncoupled<<8)         /* mono */
-            + coupled_ratio*nb_coupled /* stereo */
-            + nb_lfe*lfe_ratio;
-      channel_rate = 256*(st->bitrate_bps-lfe_offset*nb_lfe-stream_offset*(nb_coupled+nb_uncoupled))/total;
-   }
+   total = (nb_uncoupled<<8)         /* mono */
+         + coupled_ratio*nb_coupled /* stereo */
+         + nb_lfe*lfe_ratio;
+   channel_rate = 256*(opus_int64)(bitrate - lfe_offset*nb_lfe - stream_offset*(nb_coupled+nb_uncoupled) - channel_offset*nb_normal)/total;
 #ifndef FIXED_POINT
    if (st->variable_duration==OPUS_FRAMESIZE_VARIABLE && frame_size != Fs/50)
    {
@@ -719,11 +741,11 @@ static void surround_rate_allocation(
    for (i=0;i<st->layout.nb_streams;i++)
    {
       if (i<st->layout.nb_coupled_streams)
-         rate[i] = stream_offset+(channel_rate*coupled_ratio>>8);
+         rate[i] = 2*channel_offset + IMAX(0, stream_offset+(channel_rate*coupled_ratio>>8));
       else if (i!=st->lfe_stream)
-         rate[i] = stream_offset+channel_rate;
+         rate[i] = channel_offset + IMAX(0, stream_offset + channel_rate);
       else
-         rate[i] = lfe_offset+(channel_rate*lfe_ratio>>8);
+         rate[i] = IMAX(0, lfe_offset+(channel_rate*lfe_ratio>>8));
    }
 }
 
@@ -747,7 +769,8 @@ static void ambisonics_rate_allocation(
 
    if (st->bitrate_bps==OPUS_AUTO)
    {
-      total_rate = num_channels * (20000 + st->layout.nb_streams*(Fs+60*Fs/frame_size));
+      total_rate = (st->layout.nb_coupled_streams + st->layout.nb_streams) *
+         (Fs+60*Fs/frame_size) + st->layout.nb_streams * 15000;
    } else if (st->bitrate_bps==OPUS_BITRATE_MAX)
    {
       total_rate = num_channels * 320000;
@@ -861,13 +884,11 @@ static int opus_multistream_encode_native
 
    {
       opus_int32 delay_compensation;
-      int channels;
 
-      channels = st->layout.nb_streams + st->layout.nb_coupled_streams;
       opus_encoder_ctl((OpusEncoder*)ptr, OPUS_GET_LOOKAHEAD(&delay_compensation));
       delay_compensation -= Fs/400;
       frame_size = compute_frame_size(pcm, analysis_frame_size,
-            st->variable_duration, channels, Fs, st->bitrate_bps,
+            st->variable_duration, st->layout.nb_channels, Fs, st->bitrate_bps,
             delay_compensation, downmix
 #ifndef DISABLE_FLOAT_API
             , st->subframe_mem
@@ -1161,9 +1182,11 @@ int opus_multistream_encoder_ctl(OpusMSEncoder *st, int request, ...)
    case OPUS_SET_BITRATE_REQUEST:
    {
       opus_int32 value = va_arg(ap, opus_int32);
-      if (value<0 && value!=OPUS_AUTO && value!=OPUS_BITRATE_MAX)
+      if (value != OPUS_AUTO && value != OPUS_BITRATE_MAX)
       {
-         goto bad_arg;
+         if (value <= 0)
+            goto bad_arg;
+         value = IMIN(300000*st->layout.nb_channels, IMAX(500*st->layout.nb_channels, value));
       }
       st->bitrate_bps = value;
    }
@@ -1206,6 +1229,7 @@ int opus_multistream_encoder_ctl(OpusMSEncoder *st, int request, ...)
    case OPUS_GET_INBAND_FEC_REQUEST:
    case OPUS_GET_FORCE_CHANNELS_REQUEST:
    case OPUS_GET_PREDICTION_DISABLED_REQUEST:
+   case OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST:
    {
       OpusEncoder *enc;
       /* For int32* GET params, just query the first stream */
@@ -1252,6 +1276,7 @@ int opus_multistream_encoder_ctl(OpusMSEncoder *st, int request, ...)
    case OPUS_SET_FORCE_MODE_REQUEST:
    case OPUS_SET_FORCE_CHANNELS_REQUEST:
    case OPUS_SET_PREDICTION_DISABLED_REQUEST:
+   case OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST:
    {
       int s;
       /* This works for int32 params */

@@ -388,14 +388,14 @@ static void dc_reject(const opus_val16 *in, opus_int32 cutoff_Hz, opus_val16 *ou
       for (i=0;i<len;i++)
       {
          opus_val32 x, tmp, y;
-         x = SHL32(EXTEND32(in[channels*i+c]), 15);
+         x = SHL32(EXTEND32(in[channels*i+c]), 14);
          /* First stage */
          tmp = x-hp_mem[2*c];
          hp_mem[2*c] = hp_mem[2*c] + PSHR32(x - hp_mem[2*c], shift);
          /* Second stage */
          y = tmp - hp_mem[2*c+1];
          hp_mem[2*c+1] = hp_mem[2*c+1] + PSHR32(tmp - hp_mem[2*c+1], shift);
-         out[channels*i+c] = EXTRACT16(SATURATE(PSHR32(y, 15), 32767));
+         out[channels*i+c] = EXTRACT16(SATURATE(PSHR32(y, 14), 32767));
       }
    }
 }
@@ -403,24 +403,57 @@ static void dc_reject(const opus_val16 *in, opus_int32 cutoff_Hz, opus_val16 *ou
 #else
 static void dc_reject(const opus_val16 *in, opus_int32 cutoff_Hz, opus_val16 *out, opus_val32 *hp_mem, int len, int channels, opus_int32 Fs)
 {
-   int c, i;
-   float coef;
-
+   int i;
+   float coef, coef2;
    coef = 4.0f*cutoff_Hz/Fs;
-   for (c=0;c<channels;c++)
+   coef2 = 1-coef;
+   if (channels==2)
    {
+      float m0, m1, m2, m3;
+      m0 = hp_mem[0];
+      m1 = hp_mem[1];
+      m2 = hp_mem[2];
+      m3 = hp_mem[3];
+      for (i=0;i<len;i++)
+      {
+         opus_val32 x0, x1, tmp0, tmp1, y0, y1;
+         x0 = in[2*i+0];
+         x1 = in[2*i+1];
+         /* First stage */
+         tmp0 = x0-m0;
+         tmp1 = x1-m2;
+         m0 = coef*x0 + VERY_SMALL + coef2*m0;
+         m2 = coef*x1 + VERY_SMALL + coef2*m2;
+         /* Second stage */
+         y0 = tmp0 - m1;
+         y1 = tmp1 - m3;
+         m1 = coef*tmp0 + VERY_SMALL + coef2*m1;
+         m3 = coef*tmp1 + VERY_SMALL + coef2*m3;
+         out[2*i+0] = y0;
+         out[2*i+1] = y1;
+      }
+      hp_mem[0] = m0;
+      hp_mem[1] = m1;
+      hp_mem[2] = m2;
+      hp_mem[3] = m3;
+   } else {
+      float m0, m1;
+      m0 = hp_mem[0];
+      m1 = hp_mem[1];
       for (i=0;i<len;i++)
       {
          opus_val32 x, tmp, y;
-         x = in[channels*i+c];
+         x = in[i];
          /* First stage */
-         tmp = x-hp_mem[2*c];
-         hp_mem[2*c] = hp_mem[2*c] + coef*(x - hp_mem[2*c]) + VERY_SMALL;
+         tmp = x-m0;
+         m0 = coef*x + VERY_SMALL + coef2*m0;
          /* Second stage */
-         y = tmp - hp_mem[2*c+1];
-         hp_mem[2*c+1] = hp_mem[2*c+1] + coef*(tmp - hp_mem[2*c+1]) + VERY_SMALL;
-         out[channels*i+c] = y;
+         y = tmp - m1;
+         m1 = coef*tmp + VERY_SMALL + coef2*m1;
+         out[i] = y;
       }
+      hp_mem[0] = m0;
+      hp_mem[1] = m1;
    }
 }
 #endif
@@ -778,9 +811,9 @@ void downmix_float(const void *_x, opus_val32 *sub, int subframe, int offset, in
 #else
    scale = 1.f;
 #endif
-   if (C==-2)
+   if (c2==-2)
       scale /= C;
-   else
+   else if (c2>-1)
       scale /= 2;
    for (j=0;j<subframe;j++)
       sub[j] *= scale;
@@ -813,9 +846,9 @@ void downmix_int(const void *_x, opus_val32 *sub, int subframe, int offset, int 
 #else
    scale = 1.f/32768;
 #endif
-   if (C==-2)
+   if (c2==-2)
       scale /= C;
-   else
+   else if (c2>-1)
       scale /= 2;
    for (j=0;j<subframe;j++)
       sub[j] *= scale;
@@ -1066,12 +1099,12 @@ static opus_int32 compute_equiv_rate(opus_int32 bitrate, int channels,
 
 #ifndef DISABLE_FLOAT_API
 
-static int is_digital_silence(const opus_val16* pcm, int frame_size, int lsb_depth)
+static int is_digital_silence(const opus_val16* pcm, int frame_size, int channels, int lsb_depth)
 {
    int silence = 0;
    opus_val32 sample_max = 0;
 
-   sample_max = celt_maxabs16(pcm, frame_size);
+   sample_max = celt_maxabs16(pcm, frame_size*channels);
 
 #ifdef FIXED_POINT
    silence = (sample_max == 0);
@@ -1083,35 +1116,40 @@ static int is_digital_silence(const opus_val16* pcm, int frame_size, int lsb_dep
    return silence;
 }
 
-static opus_val32 compute_frame_energy(const opus_val16 *pcm, int frame_size)
+#ifdef FIXED_POINT
+static opus_val32 compute_frame_energy(const opus_val16 *pcm, int frame_size, int channels, int arch)
 {
    int i;
-#ifdef FIXED_POINT
    opus_val32 sample_max;
    int max_shift;
    int shift;
-#endif
    opus_val32 energy = 0;
-
-#ifdef FIXED_POINT
+   int len = frame_size*channels;
+   (void)arch;
    /* Max amplitude in the signal */
-   sample_max = celt_maxabs16(pcm, frame_size);
+   sample_max = celt_maxabs16(pcm, len);
 
    /* Compute the right shift required in the MAC to avoid an overflow */
-   max_shift = celt_ilog2(frame_size);
+   max_shift = celt_ilog2(len);
    shift = IMAX(0, (celt_ilog2(sample_max) << 1) + max_shift - 28);
-#endif
 
    /* Compute the energy */
-   for (i=0; i<frame_size; i++)
+   for (i=0; i<len; i++)
       energy += SHR32(MULT16_16(pcm[i], pcm[i]), shift);
 
    /* Normalize energy by the frame size and left-shift back to the original position */
-   energy /= frame_size;
+   energy /= len;
    energy = SHL32(energy, shift);
 
    return energy;
 }
+#else
+static opus_val32 compute_frame_energy(const opus_val16 *pcm, int frame_size, int channels, int arch)
+{
+   int len = frame_size*channels;
+   return celt_inner_prod(pcm, pcm, len, arch)/len;
+}
+#endif
 
 /* Decides if DTX should be turned on (=1) or off (=0) */
 static int decide_dtx_mode(float activity_probability,    /* probability that current frame contains speech/music */
@@ -1119,7 +1157,9 @@ static int decide_dtx_mode(float activity_probability,    /* probability that cu
                            opus_val32 peak_signal_energy, /* peak energy of desired signal detected so far */
                            const opus_val16 *pcm,         /* input pcm signal */
                            int frame_size,                /* frame size */
-                           int is_silence                 /* only digital silence detected in this frame */
+                           int channels,
+                           int is_silence,                 /* only digital silence detected in this frame */
+                           int arch
                           )
 {
    int is_noise;
@@ -1131,7 +1171,7 @@ static int decide_dtx_mode(float activity_probability,    /* probability that cu
       is_noise = activity_probability < DTX_ACTIVITY_THRESHOLD;
       if (is_noise)
       {
-         noise_energy = compute_frame_energy(pcm, frame_size);
+         noise_energy = compute_frame_energy(pcm, frame_size, channels, arch);
          is_sufficiently_quiet = peak_signal_energy >= (PSEUDO_SNR_THRESHOLD * noise_energy);
       }
    }
@@ -1230,7 +1270,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
     if (st->silk_mode.complexity >= 7 && st->Fs==48000)
 #endif
     {
-       if (is_digital_silence(pcm, frame_size, lsb_depth))
+       if (is_digital_silence(pcm, frame_size, st->channels, lsb_depth))
        {
           is_silence = 1;
        } else {
@@ -1243,7 +1283,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
 
        /* Track the peak signal energy */
        if (!is_silence && analysis_info.activity_probability > DTX_ACTIVITY_THRESHOLD)
-          st->peak_signal_energy = MAX32(MULT16_32_Q15(QCONST16(0.999, 15), st->peak_signal_energy), compute_frame_energy(pcm, frame_size));
+          st->peak_signal_energy = MAX32(MULT16_32_Q15(QCONST16(0.999, 15), st->peak_signal_energy),
+                compute_frame_energy(pcm, frame_size, st->channels, st->arch));
     }
 #else
     (void)analysis_pcm;
@@ -1295,7 +1336,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
        /* We need to make sure that "int" values always fit in 16 bits. */
        cbrBytes = IMIN( (3*st->bitrate_bps/8 + frame_rate3/2)/frame_rate3, max_data_bytes);
        st->bitrate_bps = cbrBytes*(opus_int32)frame_rate3*8/3;
-       max_data_bytes = cbrBytes;
+       /* Make sure we provide at least one byte to avoid failing. */
+       max_data_bytes = IMAX(1, cbrBytes);
     }
     if (max_data_bytes<3 || st->bitrate_bps < 3*frame_rate*8
        || (frame_rate<50 && (max_data_bytes*frame_rate<300 || st->bitrate_bps < 2400)))
@@ -1322,6 +1364,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
           ret = opus_packet_pad(data, ret, max_data_bytes);
           if (ret == OPUS_OK)
              ret = max_data_bytes;
+          else
+             ret = OPUS_INTERNAL_ERROR;
        }
        RESTORE_STACK;
        return ret;
@@ -1688,6 +1732,13 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
         st->mode = MODE_HYBRID;
     if (st->mode == MODE_HYBRID && curr_bandwidth <= OPUS_BANDWIDTH_WIDEBAND)
         st->mode = MODE_SILK_ONLY;
+    /* If we decided to go with CELT, make sure redundancy is off, no matter what
+       we decided earlier. */
+    if (st->mode == MODE_CELT_ONLY)
+    {
+        redundancy = 0;
+        redundancy_bytes = 0;
+    }
 
     /* printf("%d %d %d %d\n", st->bitrate_bps, st->stream_channels, st->mode, curr_bandwidth); */
     bytes_target = IMIN(max_data_bytes-redundancy_bytes, st->bitrate_bps * frame_size / (st->Fs * 8)) - 1;
@@ -2145,7 +2196,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
            /* Put CELT->SILK redundancy data in the right place. */
            if (redundancy && celt_to_silk && st->mode==MODE_HYBRID && st->use_vbr)
            {
-              OPUS_COPY(data+ret, data+nb_compr_bytes, redundancy_bytes);
+              OPUS_MOVE(data+ret, data+nb_compr_bytes, redundancy_bytes);
               nb_compr_bytes = nb_compr_bytes+redundancy_bytes;
            }
         }
@@ -2205,7 +2256,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
 #ifndef DISABLE_FLOAT_API
     if (st->use_dtx && (analysis_info.valid || is_silence))
     {
-       if (decide_dtx_mode(analysis_info.activity_probability, &st->nb_no_activity_frames, st->peak_signal_energy, pcm, frame_size, is_silence))
+       if (decide_dtx_mode(analysis_info.activity_probability, &st->nb_no_activity_frames,
+             st->peak_signal_energy, pcm, frame_size, st->channels, is_silence, st->arch))
        {
           st->rangeFinal = 0;
           data[0] = gen_toc(st->mode, st->Fs/frame_size, curr_bandwidth, st->stream_channels);
@@ -2737,6 +2789,26 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
            if (!value)
               goto bad_arg;
            *value = st->silk_mode.reducedDependency;
+        }
+        break;
+        case OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST:
+        {
+            opus_int32 value = va_arg(ap, opus_int32);
+            if(value<0 || value>1)
+            {
+               goto bad_arg;
+            }
+            celt_encoder_ctl(celt_enc, OPUS_SET_PHASE_INVERSION_DISABLED(value));
+        }
+        break;
+        case OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST:
+        {
+            opus_int32 *value = va_arg(ap, opus_int32*);
+            if (!value)
+            {
+               goto bad_arg;
+            }
+            celt_encoder_ctl(celt_enc, OPUS_GET_PHASE_INVERSION_DISABLED(value));
         }
         break;
         case OPUS_RESET_STATE:

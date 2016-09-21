@@ -158,28 +158,20 @@ static unsigned extract_collapse_mask(int *iy, int N, int B)
    return collapse_mask;
 }
 
-unsigned alg_quant(celt_norm *X, int N, int K, int spread, int B, ec_enc *enc,
-      opus_val16 gain, int resynth)
+opus_val16 op_pvq_search_c(celt_norm *X, int *iy, int K, int N, int arch)
 {
    VARDECL(celt_norm, y);
-   VARDECL(int, iy);
    VARDECL(int, signx);
    int i, j;
    int pulsesLeft;
    opus_val32 sum;
    opus_val32 xy;
    opus_val16 yy;
-   unsigned collapse_mask;
    SAVE_STACK;
 
-   celt_assert2(K>0, "alg_quant() needs at least one pulse");
-   celt_assert2(N>1, "alg_quant() needs at least two dimensions");
-
+   (void)arch;
    ALLOC(y, N, celt_norm);
-   ALLOC(iy, N, int);
    ALLOC(signx, N, int);
-
-   exp_rotation(X, N, 1, B, K, spread);
 
    /* Get rid of the sign */
    sum = 0;
@@ -218,7 +210,12 @@ unsigned alg_quant(celt_norm *X, int N, int K, int spread, int B, ec_enc *enc,
          while (++j<N);
          sum = QCONST16(1.f,14);
       }
-      rcp = EXTRACT16(MULT16_32_Q16(K-1, celt_rcp(sum)));
+#ifdef FIXED_POINT
+      rcp = EXTRACT16(MULT16_32_Q16(K, celt_rcp(sum)));
+#else
+      /* Using K+e with e < 1 guarantees we cannot get more than K pulses. */
+      rcp = EXTRACT16(MULT16_32_Q16(K+0.8, celt_rcp(sum)));
+#endif
       j=0; do {
 #ifdef FIXED_POINT
          /* It's really important to round *towards zero* here */
@@ -233,7 +230,7 @@ unsigned alg_quant(celt_norm *X, int N, int K, int spread, int B, ec_enc *enc,
          pulsesLeft -= iy[j];
       }  while (++j<N);
    }
-   celt_assert2(pulsesLeft>=1, "Allocated too many pulses in the quick pass");
+   celt_assert2(pulsesLeft>=0, "Allocated too many pulses in the quick pass");
 
    /* This should never happen, but just in case it does (e.g. on silence)
       we fill the first bin with pulses. */
@@ -322,6 +319,28 @@ unsigned alg_quant(celt_norm *X, int N, int K, int spread, int B, ec_enc *enc,
          but has the same performance otherwise. */
       iy[j] = (iy[j]^-signx[j]) + signx[j];
    } while (++j<N);
+   RESTORE_STACK;
+   return yy;
+}
+
+unsigned alg_quant(celt_norm *X, int N, int K, int spread, int B, ec_enc *enc,
+      opus_val16 gain, int resynth, int arch)
+{
+   VARDECL(int, iy);
+   opus_val16 yy;
+   unsigned collapse_mask;
+   SAVE_STACK;
+
+   celt_assert2(K>0, "alg_quant() needs at least one pulse");
+   celt_assert2(N>1, "alg_quant() needs at least two dimensions");
+
+   /* Covers vectorization by up to 4. */
+   ALLOC(iy, N+3, int);
+
+   exp_rotation(X, N, 1, B, K, spread);
+
+   yy = op_pvq_search(X, iy, K, N, arch);
+
    encode_pulses(iy, N, K, enc);
 
    if (resynth)
@@ -412,7 +431,7 @@ int stereo_itheta(const celt_norm *X, const celt_norm *Y, int stereo, int N, int
    /* 0.63662 = 2/pi */
    itheta = MULT16_16_Q15(QCONST16(0.63662f,15),celt_atan2p(side, mid));
 #else
-   itheta = (int)floor(.5f+16384*0.63662f*atan2(side,mid));
+   itheta = (int)floor(.5f+16384*0.63662f*fast_atan2f(side,mid));
 #endif
 
    return itheta;
